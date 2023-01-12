@@ -73,7 +73,7 @@ timedatectl set-ntp true
 hwclock --systohc --utc
 
 echo -e "\n### Installing additional tools"
-pacman -Sy --noconfirm --needed git reflector terminus-font dialog wget
+pacman -Sy --noconfirm --needed git reflector terminus-font dialog wget archlinux-keyring
 
 echo -e "\n### HiDPI screens"
 noyes=("Yes" "The font is too small" "No" "The font size is just fine")
@@ -93,6 +93,10 @@ clear
 password=$(get_password "User" "Enter password") || exit 1
 clear
 : ${password:?"password cannot be empty"}
+
+password_luks=$(get_password "LUKS" "Enter password") || exit 1
+clear
+: ${password_luks:?"password cannot be empty"}
 
 devicelist=$(lsblk -dplnx size -o name,size | grep -Ev "boot|rpmb|loop" | tac | tr '\n' ' ')
 read -r -a devicelist <<< $devicelist
@@ -127,68 +131,30 @@ fi
 
 echo -e "\n### Formatting partitions"
 mkfs.vfat -n "EFI" -F 32 "${part_boot}"
-echo -n ${password} | cryptsetup luksFormat --type luks2 --pbkdf argon2id --label luks $cryptargs "${part_root}"
-echo -n ${password} | cryptsetup luksOpen $cryptargs "${part_root}" luks
+echo -n ${password_luks} | cryptsetup luksFormat --type luks2 --pbkdf argon2id --label luks $cryptargs "${part_root}"
+echo -n ${password_luks} | cryptsetup luksOpen $cryptargs "${part_root}" luks
 mkfs.btrfs -L btrfs /dev/mapper/luks
 
 echo -e "\n### Setting up BTRFS subvolumes"
 mount /dev/mapper/luks /mnt
 btrfs subvolume create /mnt/root
 btrfs subvolume create /mnt/home
-btrfs subvolume create /mnt/pkgs
-btrfs subvolume create /mnt/aurbuild
-btrfs subvolume create /mnt/archbuild
-btrfs subvolume create /mnt/docker
-btrfs subvolume create /mnt/logs
 btrfs subvolume create /mnt/temp
-btrfs subvolume create /mnt/swap
-btrfs subvolume create /mnt/snapshots
 umount /mnt
 
 mount -o noatime,nodiratime,compress=zstd,subvol=root /dev/mapper/luks /mnt
-mkdir -p /mnt/{mnt/btrfs-root,efi,home,var/{cache/pacman,log,tmp,lib/{aurbuild,archbuild,docker}},swap,.snapshots}
+mkdir -p /mnt/{mnt/btrfs-root,efi,home,root}
 mount "${part_boot}" /mnt/efi
 mount -o noatime,nodiratime,compress=zstd,subvol=/ /dev/mapper/luks /mnt/mnt/btrfs-root
 mount -o noatime,nodiratime,compress=zstd,subvol=home /dev/mapper/luks /mnt/home
-mount -o noatime,nodiratime,compress=zstd,subvol=pkgs /dev/mapper/luks /mnt/var/cache/pacman
-mount -o noatime,nodiratime,compress=zstd,subvol=aurbuild /dev/mapper/luks /mnt/var/lib/aurbuild
-mount -o noatime,nodiratime,compress=zstd,subvol=archbuild /dev/mapper/luks /mnt/var/lib/archbuild
-mount -o noatime,nodiratime,compress=zstd,subvol=docker /dev/mapper/luks /mnt/var/lib/docker
-mount -o noatime,nodiratime,compress=zstd,subvol=logs /dev/mapper/luks /mnt/var/log
-mount -o noatime,nodiratime,compress=zstd,subvol=temp /dev/mapper/luks /mnt/var/tmp
-mount -o noatime,nodiratime,compress=zstd,subvol=swap /dev/mapper/luks /mnt/swap
-mount -o noatime,nodiratime,compress=zstd,subvol=snapshots /dev/mapper/luks /mnt/.snapshots
+mount -o noatime,nodiratime,compress=zstd,subvol=root /dev/mapper/luks /root
 
-echo -e "\n### Configuring custom repo"
-mkdir "/mnt/var/cache/pacman/${user}-local"
-march="$(uname -m)"
-
-if [[ "${user}" == "maximbaz" && "${hostname}" == "home-"* ]]; then
-    wget -m -nH -np -q --show-progress --progress=bar:force --reject='index.html*' --cut-dirs=2 -P "/mnt/var/cache/pacman/${user}-local" "https://pkgbuild.com/~maximbaz/repo/${march}"
-    rename -- 'maximbaz.' "${user}-local." "/mnt/var/cache/pacman/${user}-local"/*
-else
-    repo-add "/mnt/var/cache/pacman/${user}-local/${user}-local.db.tar"
-fi
-
-if ! grep "${user}" /etc/pacman.conf > /dev/null; then
-    cat >> /etc/pacman.conf << EOF
-[${user}-local]
-Server = file:///mnt/var/cache/pacman/${user}-local
-
-[maximbaz]
-Server = https://pkgbuild.com/~maximbaz/repo/${march}
-
-[options]
-CacheDir = /mnt/var/cache/pacman/pkg
-CacheDir = /mnt/var/cache/pacman/${user}-local
-EOF
-fi
 
 echo -e "\n### Installing packages"
-pacstrap -i /mnt maximbaz-base maximbaz-$(uname -m)
+pacstrap -i /mnt base linux linux-firmware btrfs-progs zsh sudo git
 
 echo -e "\n### Generating base config files"
-ln -sfT dash /mnt/usr/bin/sh
+#ln -sfT dash /mnt/usr/bin/sh
 
 cryptsetup luksHeaderBackup "${luks_header_device}" --header-backup-file /tmp/header.img
 luks_header_size="$(stat -c '%s' /tmp/header.img)"
@@ -196,30 +162,33 @@ rm -f /tmp/header.img
 
 echo "cryptdevice=PARTLABEL=primary:luks:allow-discards cryptheader=LABEL=luks:0:$luks_header_size root=LABEL=btrfs rw rootflags=subvol=root quiet mem_sleep_default=deep" > /mnt/etc/kernel/cmdline
 
-echo "FONT=$font" > /mnt/etc/vconsole.conf
+echo "KEYMAP=de-latin1" > /mnt/etc/vconsole.conf
+
 genfstab -L /mnt >> /mnt/etc/fstab
 echo "${hostname}" > /mnt/etc/hostname
 echo "en_US.UTF-8 UTF-8" >> /mnt/etc/locale.gen
-echo "en_DK.UTF-8 UTF-8" >> /mnt/etc/locale.gen
-ln -sf /usr/share/zoneinfo/Europe/Copenhagen /mnt/etc/localtime
+echo "fr_FR.UTF-8 UTF-8" >> /mnt/etc/locale.gen
+ln -sf /usr/share/zoneinfo/Europe/Paris /mnt/etc/localtime
 arch-chroot /mnt locale-gen
 cat << EOF > /mnt/etc/mkinitcpio.conf
 MODULES=()
 BINARIES=()
 FILES=()
-HOOKS=(base consolefont udev autodetect modconf block encrypt-dh filesystems keyboard)
+HOOKS=(systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)
 EOF
+# HOOKS=(base consolefont udev autodetect modconf block sd-encrypt filesystems keyboard)
+# EOF
 arch-chroot /mnt mkinitcpio -p linux
-arch-chroot /mnt arch-secure-boot initial-setup
+# arch-chroot /mnt arch-secure-boot initial-setup
 
-echo -e "\n### Configuring swap file"
-truncate -s 0 /mnt/swap/swapfile
-chattr +C /mnt/swap/swapfile
-btrfs property set /mnt/swap/swapfile compression none
-dd if=/dev/zero of=/mnt/swap/swapfile bs=1M count=4096
-chmod 600 /mnt/swap/swapfile
-mkswap /mnt/swap/swapfile
-echo "/swap/swapfile none swap defaults 0 0" >> /mnt/etc/fstab
+# echo -e "\n### Configuring swap file"
+# truncate -s 0 /mnt/swap/swapfile
+# chattr +C /mnt/swap/swapfile
+# btrfs property set /mnt/swap/swapfile compression none
+# dd if=/dev/zero of=/mnt/swap/swapfile bs=1M count=4096
+# chmod 600 /mnt/swap/swapfile
+# mkswap /mnt/swap/swapfile
+# echo "/swap/swapfile none swap defaults 0 0" >> /mnt/etc/fstab
 
 echo -e "\n### Creating user"
 arch-chroot /mnt useradd -m -s /usr/bin/zsh "$user"
@@ -232,9 +201,9 @@ echo "$user:$password" | arch-chroot /mnt chpasswd
 arch-chroot /mnt passwd -dl root
 
 echo -e "\n### Setting permissions on the custom repo"
-arch-chroot /mnt chown -R "$user:$user" "/var/cache/pacman/${user}-local/"
+# arch-chroot /mnt chown -R "$user:$user" "/var/cache/pacman/${user}-local/"
 
-if [ "${user}" = "maximbaz" ]; then
+if [ "${user}" = "jdenoy" ]; then
     echo -e "\n### Cloning dotfiles"
     arch-chroot /mnt sudo -u $user bash -c 'git clone --recursive https://github.com/maximbaz/dotfiles.git ~/.dotfiles'
 
